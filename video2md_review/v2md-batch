@@ -1,0 +1,57 @@
+#!/bin/bash
+# v2md-batch: generic batch progress watcher
+unset PATH
+export PATH="/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin"
+
+OUT_ROOT="${VIDEO2MD_OUT:-$HOME/video2md_out}"
+LOG=$(find "$OUT_ROOT" -maxdepth 2 -type f -name "*.log" 2>/dev/null | sort -r | head -1)
+
+# 找 caffeinate 包装的批 PID（兜底匹配 video2md 批脚本）
+BATCH_PID=$(pgrep -f "caffeinate.*(video2md|v2md|batch)" | grep -v "^$$$" | head -1)
+[ -z "$BATCH_PID" ] && BATCH_PID=$(pgrep -f "(video2md.*batch|v2md.*batch|batch_.*video2md|batch.sh)" | grep -v "^$$$" | head -1)
+[ -z "$BATCH_PID" ] && BATCH_PID="none"
+
+echo "=== 批进程 (BATCH_PID=$BATCH_PID) ==="
+if [ "$BATCH_PID" = "none" ]; then
+  echo "  未发现批处理包装进程"
+else
+  ps -p "$BATCH_PID" -o pid,etime,state,command 2>&1 | tail -1
+fi
+
+echo ""
+echo "=== 当前在跑 ==="
+ps aux | grep -E "video2md |mlx_whisper" | grep -v grep | awk '{print "  PID="$2"  CPU="$3"%  跑了 "$10"  "$NF}' | head -10
+
+echo ""
+echo "=== 最近输出目录进度 ==="
+find "$OUT_ROOT" -maxdepth 2 -type d 2>/dev/null | while read -r d; do
+  if [ -d "$d/frames" ]; then
+    name=${d#"$OUT_ROOT"/}
+    frames=$(find "$d/frames" -maxdepth 1 -type f -name "*.jpg" 2>/dev/null | wc -l | tr -d ' ')
+    desc_file="$d/frames/descriptions.json"
+    if [ -f "$desc_file" ]; then
+      descs=$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$desc_file" 2>/dev/null || echo "?")
+    else
+      descs=0
+    fi
+    mds=$(find "$d" -maxdepth 2 -type f -name "p*.md" ! -name "*.raw.md" 2>/dev/null | wc -l | tr -d ' ')
+    echo "  $name: 帧=$frames  描述=$descs  MD=$mds"
+  fi
+done | sort | tail -30
+
+echo ""
+echo "=== 跑完的视频（END 标记） ==="
+if [ -n "$LOG" ]; then
+  grep -E "END|ALL DONE|Done\\. Output" "$LOG" 2>/dev/null | tail -10
+else
+  echo "未找到 log"
+fi
+
+echo ""
+echo "=== 最近 log 末 5 行 ==="
+if [ -n "$LOG" ]; then
+  echo "$LOG"
+  tail -5 "$LOG" 2>/dev/null
+else
+  echo "未找到 log"
+fi

@@ -1,0 +1,1911 @@
+#!/usr/bin/env python3
+"""
+video2md — 数学课视频 → 每题 Markdown
+
+流水线：
+  video.mp4
+    ├→ ffmpeg 抽音频 → full_audio.wav
+    ├→ mlx_whisper ASR → full_audio.vtt (带时间戳)
+    ├→ ffmpeg 抽关键帧（scene detection + 固定间隔）
+    ├→ local Qwen vision (image input) → 每帧 OCR + 描述
+    └→ local Qwen 推理 → 每题 .md（含题面 + 解答 + 关键点）
+
+用法：
+  python3 video2md.py <video_path> [--out OUTPUT_DIR] [--interval 20] [--limit SECONDS]
+"""
+import argparse
+import base64
+import concurrent.futures
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import requests
+
+TOOLS_ROOT = Path(__file__).resolve().parents[1]
+if str(TOOLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(TOOLS_ROOT))
+
+from mathmd_shared import (  # noqa: E402
+    DEFAULT_BASE_URL as SHARED_DEFAULT_BASE_URL,
+    DEFAULT_MODEL as SHARED_DEFAULT_MODEL,
+    QwenClient,
+    QwenConfig,
+    fuse_problem_directory,
+    refresh_bundle_metadata,
+)
+
+API_KEY = os.environ.get("MINIMAX_API_KEY")
+BASE_URL = os.environ.get("QWEN_BASE_URL", SHARED_DEFAULT_BASE_URL).rstrip("/")
+QWEN_MODEL_DEFAULT = SHARED_DEFAULT_MODEL
+MODEL = os.environ.get("QWEN_MODEL", QWEN_MODEL_DEFAULT)
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+OPENAI_MODEL_DEFAULT = os.environ.get("OPENAI_MODEL", "gpt-5.5")
+CODEX_MODEL_DEFAULT = os.environ.get("CODEX_MODEL", "gpt-5.4")
+SUPPORTED_PROVIDERS = {"qwen"}
+LLM_PROVIDER = None
+CODEX_MODE = None
+EMBED_IMAGES_MODE = "auto"
+EMBED_IMAGE_LIMIT = 2
+WHISPER_BIN = os.environ.get("WHISPER_BIN") or shutil.which("whisper") or "whisper"
+MLX_WHISPER = os.environ.get("MLX_WHISPER_BIN") or shutil.which("mlx_whisper") or "mlx_whisper"
+VISUAL_TYPES = {
+    "geometry",
+    "combinatorics",
+    "graph",
+    "table",
+    "diagram",
+    "coordinate",
+    "figure",
+}
+VISUAL_KEYWORDS_RE = re.compile(
+    r"图形|示意图|几何图|组合图|三角形|四边形|多边形|圆|外接圆|内切圆|旁切圆|"
+    r"切线|割线|弦|弧|角平分线|垂线|高线|中线|线段|点集|坐标系|"
+    r"棋盘|染色|格点|网格|表格|图论|顶点|边|连通|路径|树|独立集"
+)
+
+
+class CodexUsageLimitError(RuntimeError):
+    pass
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def is_codex_usage_limit(text: str) -> bool:
+    lowered = (text or "").lower()
+    return "usage limit" in lowered or "try again at" in lowered
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def atomic_write_json(path: Path, data) -> None:
+    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_directory(path: Path) -> None:
+    path = Path(path)
+    for item in path.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
+
+
+def require_api_key() -> str:
+    api_key = os.environ.get("MINIMAX_API_KEY") or API_KEY
+    if not api_key:
+        raise RuntimeError("MINIMAX_API_KEY is not set. 请先运行：export MINIMAX_API_KEY=你的_key")
+    return api_key
+
+
+def require_qwen_api_key() -> str:
+    api_key = os.environ.get("QWEN_API_KEY")
+    if api_key:
+        return api_key
+    return require_api_key()
+
+
+def qwen_auth_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get("QWEN_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def require_openai_api_key() -> str:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set. 请先运行：export OPENAI_API_KEY=你的_key")
+    return api_key
+
+
+def resolve_provider(provider: str | None = None) -> str:
+    selected = (provider or os.environ.get("VIDEO2MD_PROVIDER") or "qwen").strip().lower()
+    aliases = {
+        "m3": "minimax",
+        "minimax-m3": "minimax",
+        "qwen3": "qwen",
+        "qwen3.6-35b": "qwen",
+        "qwen3.8-27b": "qwen",
+        "qwen2.5": "qwen",
+        "local": "qwen",
+        "gpt": "openai",
+    }
+    selected = aliases.get(selected, selected)
+    if selected not in SUPPORTED_PROVIDERS:
+        raise ValueError(f"Unsupported provider: {selected}. 目前仅支持：qwen")
+    return selected
+
+
+def resolve_codex_mode(mode: str | None = None) -> str:
+    selected = (mode or os.environ.get("VIDEO2MD_CODEX_MODE") or "final").strip().lower()
+    aliases = {
+        "polish": "final",
+        "review": "final",
+        "all": "full",
+        "vision": "full",
+    }
+    selected = aliases.get(selected, selected)
+    if selected not in {"final", "full"}:
+        raise ValueError(f"Unsupported codex mode: {selected}. 可选：final, full")
+    return selected
+
+
+def format_seconds(seconds: float | None) -> str:
+    if seconds is None:
+        return "??:??"
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def step_extract_audio(video: Path, out_dir: Path) -> Path:
+    out = out_dir / "audio.wav"
+    if out.exists():
+        log(f"  audio exists, skip")
+        return out
+    log(f"  extracting audio...")
+    r = run([
+        "ffmpeg", "-y", "-i", str(video),
+        "-ar", "16000", "-ac", "1",
+        "-c:a", "pcm_s16le", str(out),
+    ])
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg audio extract failed: {r.stderr[-500:]}")
+    return out
+
+
+def step_transcribe(audio: Path, out_dir: Path) -> Path:
+    vtt = out_dir / "transcript.vtt"
+    if vtt.exists():
+        log(f"  transcript exists, skip")
+        return vtt
+    log(f"  transcribing with mlx-whisper (large-v3-turbo)...")
+    r = run([
+        MLX_WHISPER, str(audio),
+        "--model", "mlx-community/whisper-large-v3-turbo",
+        "--language", "zh",
+        "--output-format", "vtt",
+        "--output-dir", str(out_dir),
+        "--output-name", "transcript",
+    ], timeout=3600)
+    if r.returncode != 0:
+        log(f"  mlx-whisper failed, falling back to small-mlx-q4...")
+        r = run([
+            MLX_WHISPER, str(audio),
+            "--model", "mlx-community/whisper-small-mlx-q4",
+            "--language", "zh",
+            "--output-format", "vtt",
+            "--output-dir", str(out_dir),
+            "--output-name", "transcript",
+        ], timeout=3600)
+        if r.returncode != 0:
+            raise RuntimeError(f"whisper failed: {r.stderr[-500:]}")
+    return vtt
+
+
+def parse_vtt(vtt_path: Path):
+    """Parse VTT → list of (start_sec, end_sec, text). Supports both MM:SS.MS and HH:MM:SS.MS formats."""
+    cues = []
+    content = vtt_path.read_text(encoding="utf-8")
+    timestamp_re = re.compile(
+        r"(?:(\d+):)?(\d+):(\d+)[.,](\d+)\s+-->\s+(?:(\d+):)?(\d+):(\d+)[.,](\d+)"
+    )
+
+    def to_seconds(h, mn, s, ms):
+        return (int(h) if h else 0) * 3600 + int(mn) * 60 + int(s) + int(ms) / 1000
+
+    for block in re.split(r"\n\s*\n", content):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines or lines[0] == "WEBVTT":
+            continue
+        time_line_idx = next((i for i, line in enumerate(lines) if "-->" in line), None)
+        if time_line_idx is None:
+            continue
+        m = timestamp_re.search(lines[time_line_idx])
+        if not m:
+            continue
+        h1, mn1, s1, ms1, h2, mn2, s2, ms2 = m.groups()
+        text_lines = [
+            line for line in lines[time_line_idx + 1:]
+            if not line.startswith(("NOTE", "STYLE", "REGION"))
+        ]
+        if not text_lines:
+            continue
+        cues.append((
+            to_seconds(h1, mn1, s1, ms1),
+            to_seconds(h2, mn2, s2, ms2),
+            " ".join(text_lines),
+        ))
+    return cues
+
+
+def get_transcript_for_range(cues, t_start, t_end):
+    """Get transcript text for a time range"""
+    lines = []
+    for s, e, text in cues:
+        if e < t_start:
+            continue
+        if s > t_end:
+            break
+        lines.append(text)
+    return " ".join(lines)
+
+
+def load_frame_manifest(frames_dir: Path) -> list:
+    manifest_path = frames_dir / "frames_manifest.json"
+    if not manifest_path.exists():
+        return []
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return data.get("frames", data if isinstance(data, list) else [])
+
+
+def write_frame_manifest(frames_dir: Path, entries: list) -> None:
+    manifest_path = frames_dir / "frames_manifest.json"
+    atomic_write_json(manifest_path, {"frames": entries})
+
+
+def frame_timestamp(frame_path: Path) -> float | None:
+    frames_dir = frame_path.parent
+    for item in load_frame_manifest(frames_dir):
+        if item.get("file") == frame_path.name:
+            return item.get("timestamp")
+    return None
+
+
+def finalize_frames_with_manifest(frames_dir: Path, entries: list) -> list:
+    original_paths = {Path(item["path"]) for item in entries}
+    entries = dedupe_frame_entries(entries)
+    kept_paths = {Path(item["path"]) for item in entries}
+    for dropped in original_paths - kept_paths:
+        try:
+            dropped.unlink()
+        except FileNotFoundError:
+            pass
+    entries = sorted(entries, key=lambda item: (item.get("timestamp") is None, item.get("timestamp") or 0.0, item["path"].name))
+    tmp_paths = []
+    for idx, item in enumerate(entries):
+        src = Path(item["path"])
+        tmp = frames_dir / f"__tmp_frame_{idx:06d}.jpg"
+        src.rename(tmp)
+        tmp_paths.append(tmp)
+    final_frames = []
+    manifest_entries = []
+    for idx, tmp in enumerate(tmp_paths):
+        final = frames_dir / f"frame_{idx:06d}.jpg"
+        tmp.rename(final)
+        final_frames.append(final)
+        manifest_entries.append({
+            "idx": idx,
+            "file": final.name,
+            "timestamp": entries[idx].get("timestamp"),
+            "source": entries[idx].get("source", "unknown"),
+            "original_file": entries[idx]["path"].name,
+        })
+    write_frame_manifest(frames_dir, manifest_entries)
+    return final_frames
+
+
+def dedupe_frame_entries(entries: list, tolerance_s: float = 0.75) -> list:
+    """Drop near-duplicate timestamp frames, preferring scene frames over interval frames."""
+    def priority(item):
+        return 0 if item.get("source") == "scene" else 1
+
+    known_ts = [
+        item for item in entries
+        if item.get("timestamp") is not None
+    ]
+    unknown_ts = [
+        item for item in entries
+        if item.get("timestamp") is None
+    ]
+
+    kept = []
+    for item in sorted(known_ts, key=lambda x: (float(x["timestamp"]), priority(x))):
+        ts = float(item["timestamp"])
+        duplicate_idx = None
+        for idx, existing in enumerate(kept):
+            if abs(float(existing["timestamp"]) - ts) <= tolerance_s:
+                duplicate_idx = idx
+                break
+        if duplicate_idx is None:
+            kept.append(item)
+            continue
+        if priority(item) < priority(kept[duplicate_idx]):
+            kept[duplicate_idx] = item
+
+    return sorted(kept + unknown_ts, key=lambda item: (item.get("timestamp") is None, item.get("timestamp") or 0.0, item["path"].name))
+
+
+def step_extract_frames(video: Path, out_dir: Path, interval_s: int = 20, scene_threshold: float = 0.3) -> list:
+    """Extract frames at scene changes + every N seconds, dedup by hash"""
+    frames_dir = out_dir / "frames"
+    if frames_dir.exists() and any(frames_dir.glob("*.jpg")):
+        manifest = load_frame_manifest(frames_dir)
+        if manifest:
+            existing = [frames_dir / item["file"] for item in manifest if (frames_dir / item["file"]).exists()]
+        else:
+            existing = sorted(frames_dir.glob("*.jpg"))
+            write_frame_manifest(frames_dir, [
+                {"idx": i, "file": f.name, "timestamp": i * interval_s, "source": "legacy"}
+                for i, f in enumerate(existing)
+            ])
+        log(f"  {len(existing)} frames exist, skip extract")
+        return existing
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    # Clear any partial
+    clear_directory(frames_dir)
+
+    log(f"  extracting frames (interval={interval_s}s, scene>={scene_threshold})...")
+
+    # First: extract at fixed intervals
+    r = run([
+        "ffmpeg", "-y", "-i", str(video),
+        "-vf", f"fps=1/{interval_s},format=yuvj420p",
+        "-q:v", "2",
+        "-frame_pts", "1",
+        str(frames_dir / "f%010d.jpg"),
+    ])
+    if r.returncode != 0:
+        log(f"  interval extract failed: {r.stderr[-300:]}")
+    interval_frames = sorted(frames_dir.glob("f*.jpg"))
+    if not interval_frames:
+        fallback = frames_dir / "fallback_0000000000.jpg"
+        fallback_result = run([
+            "ffmpeg", "-y", "-ss", "0", "-i", str(video),
+            "-frames:v", "1",
+            "-vf", "format=yuvj420p",
+            "-q:v", "2",
+            str(fallback),
+        ])
+        if fallback_result.returncode == 0 and fallback.exists():
+            interval_frames = [fallback]
+            log("    interval extraction fallback: first frame")
+    log(f"    interval frames: {len(interval_frames)}")
+
+    # Then: extract at scene changes
+    r = run([
+        "ffmpeg", "-y", "-i", str(video),
+        "-vf", f"select='gt(scene,{scene_threshold})',showinfo,format=yuvj420p",
+        "-vsync", "vfr",
+        "-q:v", "2",
+        str(frames_dir / "scene_%010d.jpg"),
+    ], timeout=1800)
+    scene_frames = sorted(frames_dir.glob("scene_*.jpg"))
+    log(f"    scene frames: {len(scene_frames)}")
+
+    scene_times = [float(x) for x in re.findall(r"pts_time:([0-9.]+)", r.stderr or "")]
+    entries = []
+    for idx, frame in enumerate(interval_frames):
+        entries.append({"path": frame, "timestamp": idx * interval_s, "source": "interval"})
+    for idx, frame in enumerate(scene_frames):
+        ts = scene_times[idx] if idx < len(scene_times) else None
+        entries.append({"path": frame, "timestamp": ts, "source": "scene"})
+
+    if not entries:
+        raise RuntimeError("ffmpeg frame extract produced no frames")
+
+    all_frames = finalize_frames_with_manifest(frames_dir, entries)
+    log(f"  total frames: {len(all_frames)}")
+    return all_frames
+
+
+def m3_complete(messages, max_tokens=2048, temperature=0.0, max_retries=5, timeout=180):
+    """Call local/minimax-compatible chat completion with retry on 429/5xx/timeout."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {require_api_key()}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": MODEL,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "messages": messages,
+                },
+                timeout=timeout,
+            )
+        except requests.RequestException as e:
+            last_err = f"M3 request failed: {e}"
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt + 1
+                log(f"  M3 request error, retry in {wait}s ({attempt+1}/{max_retries}): {e}")
+                time.sleep(wait)
+                continue
+            break
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"]
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+            wait = 2 ** attempt + 1
+            log(f"  M3 {resp.status_code}, retry in {wait}s ({attempt+1}/{max_retries})")
+            time.sleep(wait)
+            continue
+        last_err = f"M3 error {resp.status_code}: {resp.text[:300]}"
+        break
+    raise RuntimeError(last_err or "M3: max retries exhausted")
+
+
+def qwen_complete(messages, max_tokens=2048, temperature=0.0, max_retries=5, timeout=180):
+    """Call local qwen chat completion with retry on 429/5xx/timeout."""
+    client = QwenClient(
+        QwenConfig(
+            base_url=BASE_URL,
+            model=MODEL,
+            api_key=os.environ.get("QWEN_API_KEY"),
+            timeout=timeout,
+            retries=max(1, max_retries),
+        ),
+        request_post=requests.post,
+    )
+    return client.complete(messages, max_tokens=max_tokens, temperature=temperature)
+
+
+def openai_output_text(data: dict) -> str:
+    if data.get("output_text"):
+        return data["output_text"]
+
+    chunks = []
+    for item in data.get("output", []):
+        for part in item.get("content", []):
+            if part.get("type") in ("output_text", "text") and part.get("text"):
+                chunks.append(part["text"])
+    if chunks:
+        return "\n".join(chunks)
+    raise RuntimeError(f"OpenAI response has no output_text: {str(data)[:300]}")
+
+
+def openai_complete(prompt: str, max_tokens=2048, temperature=0.0, max_retries=5, timeout=180) -> str:
+    """Call OpenAI Responses API for text generation."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                f"{OPENAI_BASE_URL}/responses",
+                headers={
+                    "Authorization": f"Bearer {require_openai_api_key()}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": os.environ.get("OPENAI_MODEL", OPENAI_MODEL_DEFAULT),
+                    "input": prompt,
+                    "max_output_tokens": max_tokens,
+                },
+                timeout=timeout,
+            )
+        except requests.RequestException as e:
+            last_err = f"OpenAI request failed: {e}"
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt + 1
+                log(f"  OpenAI request error, retry in {wait}s ({attempt+1}/{max_retries}): {e}")
+                time.sleep(wait)
+                continue
+            break
+        if resp.status_code == 200:
+            return openai_output_text(resp.json())
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+            wait = 2 ** attempt + 1
+            log(f"  OpenAI {resp.status_code}, retry in {wait}s ({attempt+1}/{max_retries})")
+            time.sleep(wait)
+            continue
+        last_err = f"OpenAI error {resp.status_code}: {resp.text[:300]}"
+        break
+    raise RuntimeError(last_err or "OpenAI: max retries exhausted")
+
+
+def prepare_image_for_vision(image_path: Path, max_side: int = 1600, quality: int = 85) -> Path:
+    """Resize very large frames before base64 upload to keep Qwen vision requests lighter."""
+    try:
+        from PIL import Image
+    except Exception:
+        return image_path
+
+    image_path = Path(image_path)
+    try:
+        with Image.open(image_path) as im:
+            w, h = im.size
+            if max(w, h) <= max_side and image_path.stat().st_size <= 1_500_000:
+                return image_path
+
+            scale = min(max_side / max(w, h), 1.0)
+            new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+            cache_dir = image_path.parent / ".vision_cache"
+            cache_dir.mkdir(exist_ok=True)
+            out = cache_dir / f"{image_path.stem}_max{max_side}_q{quality}.jpg"
+            if out.exists() and out.stat().st_mtime >= image_path.stat().st_mtime:
+                return out
+
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            if im.size != new_size:
+                resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+                im = im.resize(new_size, resampling)
+            im.save(out, format="JPEG", quality=quality, optimize=True)
+            return out
+    except Exception as e:
+        log(f"  ⚠ image preprocess failed for {image_path.name}: {e}")
+        return image_path
+
+
+def m3_vision(image_paths: list, prompt: str, max_tokens=2000) -> str:
+    """Call M3 with multiple images"""
+    content = []
+    for img in image_paths:
+        prepared = prepare_image_for_vision(Path(img))
+        with open(prepared, "rb") as f:
+            b64 = base64.standard_b64encode(f.read()).decode()
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+        })
+    content.append({"type": "text", "text": prompt})
+    return m3_complete([{"role": "user", "content": content}], max_tokens=max_tokens)
+
+
+def qwen_vision(image_paths: list, prompt: str, max_tokens=2000) -> str:
+    """Call qwen with multiple images."""
+    prepared = [prepare_image_for_vision(Path(img)) for img in image_paths]
+    client = QwenClient(
+        QwenConfig(
+            base_url=BASE_URL,
+            model=MODEL,
+            api_key=os.environ.get("QWEN_API_KEY"),
+            timeout=180,
+            retries=5,
+        ),
+        request_post=requests.post,
+    )
+    return client.vision(prepared, prompt, max_tokens=max_tokens)
+
+
+def openai_vision(image_paths: list, prompt: str, max_tokens=2000) -> str:
+    """Call OpenAI Responses API with multiple local images."""
+    content = [{"type": "input_text", "text": prompt}]
+    for img in image_paths:
+        prepared = prepare_image_for_vision(Path(img))
+        with open(prepared, "rb") as f:
+            b64 = base64.standard_b64encode(f.read()).decode()
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:image/jpeg;base64,{b64}",
+        })
+    return openai_complete(
+        [{
+            "role": "user",
+            "content": content,
+        }],
+        max_tokens=max_tokens,
+    )
+
+
+def codex_exec(prompt: str, image_paths: list | None = None, timeout=1800, max_retries=3) -> str:
+    """Run Codex CLI non-interactively using the current ChatGPT/Codex login."""
+    image_paths = image_paths or []
+    last_err = None
+    for attempt in range(max_retries):
+        with tempfile.TemporaryDirectory(prefix="video2md_codex_") as td:
+            out_path = Path(td) / "last_message.txt"
+            cmd = [
+                "codex", "exec",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--skip-git-repo-check",
+                "-m", os.environ.get("CODEX_MODEL", CODEX_MODEL_DEFAULT),
+                "-o", str(out_path),
+            ]
+            for image_path in image_paths:
+                cmd.extend(["--image", str(image_path)])
+            cmd.append("-")
+            try:
+                r = run(cmd, input=prompt, timeout=timeout)
+            except subprocess.TimeoutExpired as e:
+                last_err = f"Codex CLI timed out after {timeout}s"
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt + 1
+                    log(f"  Codex timeout, retry in {wait}s ({attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                break
+
+            combined = f"{r.stderr or ''}\n{r.stdout or ''}"
+            if r.returncode != 0:
+                if is_codex_usage_limit(combined):
+                    raise CodexUsageLimitError(
+                        "Codex usage limit reached. 当前进度已断点保存；等额度恢复后重跑同一命令即可继续。\n"
+                        f"{combined[-1000:]}"
+                    )
+                last_err = (
+                    "Codex CLI failed. 请确认 `codex login status` 显示 Logged in using ChatGPT。"
+                    f"\nSTDERR:\n{(r.stderr or '')[-1000:]}\nSTDOUT:\n{(r.stdout or '')[-1000:]}"
+                )
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt + 1
+                    log(f"  Codex CLI failed, retry in {wait}s ({attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                break
+            if out_path.exists():
+                text = out_path.read_text(encoding="utf-8").strip()
+                if text:
+                    return text
+            if r.stdout.strip():
+                return r.stdout.strip()
+            last_err = "Codex CLI finished but produced no output"
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt + 1
+                log(f"  Codex empty output, retry in {wait}s ({attempt+1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            break
+    raise RuntimeError(last_err or "Codex CLI failed")
+
+
+def codex_complete(prompt: str, max_tokens=2048, temperature=0.0, timeout=1800) -> str:
+    return codex_exec(prompt, timeout=timeout)
+
+
+def codex_vision(image_paths: list, prompt: str, max_tokens=2000, timeout=1800) -> str:
+    prepared_images = [prepare_image_for_vision(Path(img)) for img in image_paths]
+    return codex_exec(prompt, image_paths=prepared_images, timeout=timeout)
+
+
+def llm_complete(prompt: str, max_tokens=2048, temperature=0.0) -> str:
+    provider = resolve_provider(LLM_PROVIDER)
+    if provider == "codex":
+        return codex_complete(prompt, max_tokens=max_tokens, temperature=temperature)
+    if provider == "openai":
+        return openai_complete(prompt, max_tokens=max_tokens, temperature=temperature)
+    if provider == "qwen":
+        return qwen_complete([{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature)
+    return m3_complete([{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature)
+
+
+def llm_vision(image_paths: list, prompt: str, max_tokens=2000) -> str:
+    provider = resolve_provider(LLM_PROVIDER)
+    if provider == "codex":
+        if resolve_codex_mode(CODEX_MODE) != "full":
+            raise RuntimeError(
+                "Codex final mode 不做逐帧图片描述。请先准备 frames/descriptions.json，"
+                "或使用 --codex-mode full 让 Codex 接管视觉步骤。"
+            )
+        return codex_vision(image_paths, prompt, max_tokens=max_tokens)
+    if provider == "openai":
+        return openai_vision(image_paths, prompt, max_tokens=max_tokens)
+    if provider == "qwen":
+        return qwen_vision(image_paths, prompt, max_tokens=max_tokens)
+    return m3_vision(image_paths, prompt, max_tokens=max_tokens)
+
+
+def extract_json_object_containing(raw: str, key: str) -> str | None:
+    anchor = re.search(rf'"{re.escape(key)}"\s*:', raw)
+    if not anchor:
+        return None
+    start = raw.rfind("{", 0, anchor.end())
+    if start < 0:
+        return None
+
+    depth = 0
+    in_str = False
+    esc = False
+    for idx in range(start, len(raw)):
+        c = raw[idx]
+        if esc:
+            esc = False
+            continue
+        if c == "\\":
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[start:idx + 1]
+    return None
+
+
+def repair_json_invalid_escapes(text: str) -> str:
+    """Make model JSON with LaTeX backslashes parseable without changing intended text."""
+    short_escapes = {'"', "\\", "/"}
+    out = []
+    in_str = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and in_str:
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if nxt == "u" and re.match(r"^[0-9a-fA-F]{4}", text[i + 2:i + 6]):
+                out.append(text[i:i + 6])
+                i += 6
+                continue
+            elif nxt in short_escapes:
+                out.append(c + nxt)
+                i += 2
+                continue
+            else:
+                out.append("\\\\")
+            i += 1
+            continue
+        if c == '"':
+            in_str = not in_str
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def loads_model_json(text: str):
+    try:
+        return json.loads(repair_json_invalid_escapes(text))
+    except json.JSONDecodeError:
+        return json.loads(text)
+
+
+def extract_frames_payload(raw: str) -> dict:
+    js_text = extract_json_object_containing(raw, "frames")
+    if js_text is not None:
+        return loads_model_json(js_text)
+
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
+    if fenced:
+        data = loads_model_json(fenced.group(1))
+        if isinstance(data, list):
+            return {"frames": data}
+        if isinstance(data, dict) and "frames" in data:
+            return data
+
+    raise ValueError("no frames JSON payload found")
+
+
+def make_missing_batches(missing: list, frames: list, batch_size: int) -> list:
+    batches = []
+    current = []
+    prev = None
+    for idx in missing:
+        if prev is not None and (idx != prev + 1 or len(current) >= batch_size):
+            batches.append(current)
+            current = []
+        current.append((idx, frames[idx]))
+        prev = idx
+    if current:
+        batches.append(current)
+    return batches
+
+
+def frame_description_has_visual_metadata(item) -> bool:
+    """Return true when a cached frame description has the visual fields needed for image embedding."""
+    if not isinstance(item, dict):
+        return False
+    return (
+        "has_visual_diagram" in item
+        and "visual_type" in item
+        and "visual_importance" in item
+    )
+
+
+def step_describe_frames(frames: list, batch_size: int = 4) -> dict:
+    """For each frame, get Qwen's description: text content + problem boundaries.
+    Loads existing descriptions.json and only fills missing or legacy frames (idempotent)."""
+    if not frames:
+        log("  no frames to describe")
+        return {}
+    desc_path = frames[0].parent / "descriptions.json"
+    failed_raw_dir = frames[0].parent / "failed_raw"
+    descriptions = {}
+    if desc_path.exists():
+        descriptions = json.loads(desc_path.read_text())
+        log(f"  {len(descriptions)} existing descriptions loaded")
+
+    all_idx = set(range(len(frames)))
+    missing = []
+    for idx in sorted(all_idx):
+        item = descriptions.get(str(idx), descriptions.get(idx))
+        if item is None or not frame_description_has_visual_metadata(item):
+            missing.append(idx)
+    if not missing:
+        log(f"  → {len(descriptions)} frame descriptions (complete)")
+        return descriptions
+    log(f"  need to describe {len(missing)} missing/legacy frames: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+
+    # 立即保存空状态，让 progress 可见
+    atomic_write_json(desc_path, descriptions)
+
+    log(f"  filling {len(missing)} gaps via {resolve_provider(LLM_PROVIDER)} (sequential, batch={batch_size})...")
+
+    def _describe_batch(i_batch):
+        i, batch = i_batch
+        frame_indices = [idx for idx, _ in batch]
+        image_paths = [path for _, path in batch]
+        frame_info = "\n".join([
+            f"Frame {idx} (t≈{estimate_time(path, len(frames))}): see image {j+1}"
+            for j, (idx, path) in enumerate(batch)
+        ])
+        prompt = f"""你是数学课助教。这是连续的{len(batch)}帧（间隔约{INTERVAL_S}秒）。
+
+{frame_info}
+
+对每张图：
+1. 用中文描述画面内容（板书、PPT、题目、公式）
+2. 如果有公式或题目，用 LaTeX 写出来
+3. 判断是否是**新题/新概念**开始（vs 延续上一页）
+4. 如果是 new topic，给一个简短标题（10字内）
+5. 判断画面是否有值得保留到 Markdown 的图像：几何图、组合构造图、棋盘/染色图、图论图、表格、坐标图等
+
+**严禁**：在 description 字段内使用英文双引号 `"`，必须用中文引号「」或单引号 `'`，避免破坏 JSON 结构。
+
+返回严格 JSON：{{"frames": [
+  {{"idx": 0, "description": "...", "is_new_topic": true/false, "topic_title": "...", "has_visual_diagram": true/false, "visual_type": "geometry/combinatorics/graph/table/coordinate/diagram/text", "visual_importance": 0-5}},
+  ...
+]}}"""
+
+        for attempt in range(3):
+            try:
+                raw = llm_vision(image_paths, prompt, max_tokens=3000)
+            except CodexUsageLimitError:
+                raise
+            except Exception as e:
+                log(f"  ✗ batch {i} attempt {attempt+1}: vision call failed: {e}")
+                time.sleep(2 ** attempt + 1)
+                continue
+            try:
+                data = extract_frames_payload(raw)
+            except (ValueError, json.JSONDecodeError) as e:
+                failed_raw_dir.mkdir(exist_ok=True)
+                raw_path = failed_raw_dir / f"batch_{i:06d}_attempt_{attempt+1}.txt"
+                atomic_write_text(raw_path, raw, encoding="utf-8")
+                log(f"  ✗ batch {i} attempt {attempt+1}: JSON parse: {e}")
+                time.sleep(2 ** attempt + 1)
+                continue
+            items = data.get("frames", [])
+            if len(items) != len(batch):
+                log(f"  ⚠ batch {i}: got {len(items)}/{len(batch)} frames")
+            return [(frame_indices[j], item) for j, item in enumerate(items[:len(frame_indices)])]
+        log(f"  ✗ batch {i}: all 3 attempts failed, dropping batch")
+        return []
+
+    missing_batches = [(batch[0][0], batch) for batch in make_missing_batches(missing, frames, batch_size)]
+
+    for i, batch in missing_batches:
+        batch_result = _describe_batch((i, batch))
+        for idx, item in batch_result:
+            descriptions[str(idx)] = item
+        # Partial success: 每个 batch 跑完都写一次盘
+        if batch_result:
+            atomic_write_json(desc_path, descriptions)
+
+    atomic_write_json(desc_path, descriptions)
+    log(f"  → {len(descriptions)} frame descriptions")
+    return descriptions
+
+
+def _looks_like_problem_md(content: str) -> bool:
+    """Sanity check on Qwen output. 宽松版：只查长度 + 至少一个 markdown 标题。"""
+    if not content or len(content) < 100:
+        return False
+    # 至少有一个 markdown 标题（# 或 ##）或明显的"题"字
+    if not re.search(r"^#{1,3} ", content, re.MULTILINE):
+        return False
+    return True
+
+
+def estimate_time(frame_path: Path, total: int) -> str:
+    """Estimate timestamp from frame manifest; falls back to unknown for legacy frames."""
+    return format_seconds(frame_timestamp(frame_path))
+
+
+def normalize_title(title: str) -> str:
+    title = re.sub(r"\s+", "", title or "")
+    title = re.sub(r"^(第?[0-9一二三四五六七八九十]+[题问讲节部分页、.．:：-]*)+", "", title)
+    title = re.sub(r"(新题|例题|习题|题目|继续|板书|PPT|页面|讲解|概念)", "", title)
+    return title[:24]
+
+
+def is_generic_title(title: str) -> bool:
+    compact = re.sub(r"\s+", "", title or "")
+    if re.fullmatch(r"第?[0-9一二三四五六七八九十]+题", compact):
+        return False
+    normalized = normalize_title(title)
+    return not normalized or normalized in {"片段", "内容", "数学", "问题"}
+
+
+def titles_similar(left: str, right: str) -> bool:
+    a = normalize_title(left)
+    b = normalize_title(right)
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
+
+
+def merge_problem_segments(problems: list, min_frames: int = 2) -> list:
+    """Merge likely false-positive topic boundaries from sparse slide changes."""
+    merged = []
+    for problem in problems:
+        current = dict(problem)
+        if not merged:
+            merged.append(current)
+            continue
+
+        prev = merged[-1]
+        prev_len = prev["end_idx"] - prev["start_idx"] + 1
+        curr_len = current["end_idx"] - current["start_idx"] + 1
+        adjacent = current["start_idx"] <= prev["end_idx"] + 1
+        short_edge = prev_len < min_frames or curr_len < min_frames
+        weak_title = is_generic_title(prev["title"]) or is_generic_title(current["title"])
+        same_topic = titles_similar(prev["title"], current["title"])
+
+        if adjacent and short_edge and (same_topic or weak_title):
+            prev["end_idx"] = max(prev["end_idx"], current["end_idx"])
+            if len(current["title"]) > len(prev["title"]) and not is_generic_title(current["title"]):
+                prev["title"] = current["title"]
+            continue
+
+        merged.append(current)
+    return merged
+
+
+def step_segment_problems(descriptions: dict, cues: list) -> list:
+    """Group frames into problems based on is_new_topic + content"""
+    boundaries = [0]
+    sorted_idx = sorted(int(k) for k in descriptions.keys())
+    if not sorted_idx:
+        return []
+    for idx in sorted_idx:
+        desc = descriptions.get(str(idx), descriptions.get(idx, {}))
+        if desc.get("is_new_topic") and idx != boundaries[-1]:
+            boundaries.append(idx)
+    if boundaries[-1] != sorted_idx[-1] + 1:
+        boundaries.append(sorted_idx[-1] + 1)
+
+    # Each problem = frames [boundaries[i], boundaries[i+1])
+    problems = []
+    for i in range(len(boundaries) - 1):
+        start, end = boundaries[i], boundaries[i+1]
+        if end - start < 1:
+            continue
+        first_desc = descriptions.get(str(start), descriptions.get(start, {}))
+        title = first_desc.get("topic_title") or first_desc.get("description", "").split("\n")[0][:60]
+        problems.append({
+            "start_idx": start,
+            "end_idx": end - 1,
+            "title": title or f"片段 {i+1}",
+        })
+    return merge_problem_segments(problems)
+
+
+def strip_think_block(text: str) -> str:
+    """Remove <think>...</think> blocks emitted before the actual answer."""
+    cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    # Also strip any leading whitespace / "Here is..." preambles
+    cleaned = cleaned.lstrip()
+    return cleaned
+
+
+def replace_inline_math_delimiters(line: str) -> str:
+    parts = re.split(r"(`[^`]*`)", line)
+    for i, part in enumerate(parts):
+        if part.startswith("`") and part.endswith("`"):
+            continue
+        parts[i] = part.replace(r"\(", "$").replace(r"\)", "$")
+    return "".join(parts)
+
+
+def normalize_markdown_for_obsidian(text: str) -> str:
+    """Convert common LaTeX delimiters to Obsidian-friendly $ / $$ delimiters."""
+    lines = text.splitlines()
+    converted = []
+    in_fence = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            converted.append(line)
+            in_fence = not in_fence
+            continue
+        quote_match = re.match(r"^(\s*>+\s*)(\\\[|\\\])\s*$", line)
+        if not in_fence and quote_match:
+            converted.append(f"{quote_match.group(1)}$$")
+            continue
+        if not in_fence and stripped in (r"\[", r"\]"):
+            indent = line[:len(line) - len(line.lstrip())]
+            converted.append(f"{indent}$$")
+            continue
+        if not in_fence:
+            line = replace_inline_math_delimiters(line)
+        converted.append(line)
+    trailing = "\n" if text.endswith("\n") else ""
+    return "\n".join(converted) + trailing
+
+
+def _coerce_visual_importance(value) -> float:
+    try:
+        return max(0.0, min(5.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def score_visual_frame(desc: dict) -> float:
+    """Score whether a frame should be embedded as a useful diagram/image."""
+    if not isinstance(desc, dict):
+        return 0.0
+
+    score = 0.0
+    if desc.get("has_visual_diagram") is True:
+        score += 4.0
+
+    visual_type = str(desc.get("visual_type") or "").strip().lower()
+    if visual_type in VISUAL_TYPES:
+        score += 3.0
+    elif visual_type in {"text", "none", "formula", "blackboard"}:
+        score -= 1.0
+
+    score += _coerce_visual_importance(desc.get("visual_importance"))
+
+    description = str(desc.get("description") or "")
+    if VISUAL_KEYWORDS_RE.search(description):
+        score += 2.0
+
+    return score
+
+
+def select_problem_visual_frames(
+    problem: dict,
+    frames: list,
+    descriptions: dict,
+    mode: str = "auto",
+    max_images: int = 2,
+) -> list:
+    """Pick the most useful frame images for a problem segment."""
+    mode = (mode or "auto").strip().lower()
+    if mode == "never" or max_images <= 0:
+        return []
+
+    idx_start = max(0, int(problem.get("start_idx", 0)))
+    idx_end = min(len(frames) - 1, int(problem.get("end_idx", idx_start)))
+    if idx_end < idx_start:
+        return []
+
+    candidates = []
+    for idx in range(idx_start, idx_end + 1):
+        desc = descriptions.get(str(idx)) or descriptions.get(idx, {})
+        score = score_visual_frame(desc)
+        if mode == "auto" and score < 2.0:
+            continue
+        candidates.append((score if mode == "auto" else max(score, 1.0), idx, frames[idx]))
+
+    if not candidates:
+        return []
+
+    selected = sorted(candidates, key=lambda item: (-item[0], item[1]))[:max_images]
+    return [(idx, frame) for _, idx, frame in sorted(selected, key=lambda item: item[1])]
+
+
+def materialize_problem_visual_assets(selected_frames: list, problems_dir: Path, problem_number: int) -> list:
+    """Copy selected frame images under problems/assets so markdown remains portable."""
+    if not selected_frames:
+        return []
+    assets_dir = Path(problems_dir) / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    assets = []
+    for idx, frame_path in selected_frames:
+        frame_path = Path(frame_path)
+        suffix = frame_path.suffix.lower() or ".jpg"
+        dest = assets_dir / f"p{problem_number:03d}_{frame_path.stem}{suffix}"
+        shutil.copy2(frame_path, dest)
+        assets.append({
+            "idx": idx,
+            "path": dest,
+            "relative_path": f"assets/{dest.name}",
+            "timestamp": frame_timestamp(frame_path),
+        })
+    return assets
+
+
+def inject_visual_section(content: str, assets: list) -> str:
+    """Insert a Markdown screenshot section after the problem statement when possible."""
+    if not assets or "## 视频截图" in content:
+        return content
+
+    lines = ["## 视频截图", ""]
+    for i, asset in enumerate(assets, start=1):
+        timestamp = format_seconds(asset.get("timestamp"))
+        lines.append(f"![视频截图 {i}（t≈{timestamp}）]({asset['relative_path']})")
+    lines.append("")
+    section = "\n".join(lines) + "\n"
+
+    match = re.search(r"(?m)^## 解答\s*$", content)
+    if match:
+        return content[:match.start()] + section + content[match.start():]
+
+    match = re.search(r"(?m)^## 老师强调的关键点\s*$", content)
+    if match:
+        return content[:match.start()] + section + content[match.start():]
+
+    return content.rstrip() + "\n\n" + section
+
+
+def inject_visuals_for_problem_content(
+    content: str,
+    problem: dict,
+    frames: list,
+    descriptions: dict,
+    problems_dir: Path,
+    problem_number: int,
+    mode: str,
+    max_images: int,
+) -> str:
+    selected_frames = select_problem_visual_frames(
+        problem,
+        frames,
+        descriptions,
+        mode=mode,
+        max_images=max_images,
+    )
+    visual_assets = materialize_problem_visual_assets(selected_frames, problems_dir, problem_number=problem_number)
+    return inject_visual_section(content, visual_assets)
+
+
+def resolve_problem_markdown_path(problems_dir: Path, problem_number: int, preferred_name: str) -> Path:
+    """Reuse an existing pNNN markdown file even when a regenerated title changes."""
+    preferred = problems_dir / preferred_name
+    if preferred.exists():
+        return preferred
+    prefix = f"p{problem_number:03d}_"
+    candidates = sorted(
+        path for path in problems_dir.glob(f"{prefix}*.md")
+        if not path.name.endswith(".raw.md")
+    )
+    if candidates:
+        return candidates[0]
+    return preferred
+
+
+def list_existing_problem_markdowns(problems_dir: Path) -> list[Path]:
+    return sorted(
+        path for path in Path(problems_dir).glob("p[0-9][0-9][0-9]_*.md")
+        if not path.name.endswith(".raw.md")
+    )
+
+
+def retrofit_existing_problem_markdowns(
+    problems: list,
+    frames: list,
+    descriptions: dict,
+    problems_dir: Path,
+    mode: str,
+    max_images: int,
+) -> list[tuple[Path, str]]:
+    """Inject screenshots into existing problem files without changing segmentation or index."""
+    results = []
+    for i, fpath in enumerate(list_existing_problem_markdowns(problems_dir), start=1):
+        if i > len(problems):
+            results.append((fpath, "no-segment"))
+            continue
+        content = fpath.read_text(encoding="utf-8")
+        updated = inject_visuals_for_problem_content(
+            content,
+            problems[i - 1],
+            frames,
+            descriptions,
+            problems_dir,
+            problem_number=i,
+            mode=mode,
+            max_images=max_images,
+        )
+        if updated != content:
+            atomic_write_text(fpath, updated, encoding="utf-8")
+            results.append((fpath, "updated"))
+        else:
+            results.append((fpath, "unchanged"))
+    return results
+
+
+FUSION_CONTINUATION_RE = re.compile(
+    r"记号|事实|引理|情形|分析|继续|证明|构造|关系链|回到|推广|标准|置换|化记号|分解|一般"
+)
+
+
+def problem_file_number(path: Path) -> int:
+    match = re.match(r"p(\d{3})_", Path(path).name)
+    return int(match.group(1)) if match else 0
+
+
+def first_markdown_heading(content: str, fallback: str = "融合题目") -> str:
+    match = re.search(r"(?m)^#\s+(.+?)\s*$", content or "")
+    return match.group(1).strip() if match else fallback
+
+
+def markdown_section(content: str, heading: str) -> str:
+    pattern = rf"(?ms)^##\s+{re.escape(heading)}\s*\n(.*?)(?=^##\s+|\Z)"
+    match = re.search(pattern, content or "")
+    return match.group(1).strip() if match else ""
+
+
+def markdown_section_any(content: str, headings: list[str]) -> str:
+    for heading in headings:
+        section = markdown_section(content, heading)
+        if section:
+            return section
+    return ""
+
+
+def problem_source_lines(content: str, source_file: str) -> list[str]:
+    sources = []
+    for line in (content or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("**来源**"):
+            sources.append(f"- {stripped}，原片段：{source_file}")
+        elif stripped.startswith("- **来源**"):
+            sources.append(stripped if "原片段：" in stripped else f"{stripped}，原片段：{source_file}")
+        elif stripped.startswith("- 视频 [t="):
+            sources.append(stripped if "原片段：" in stripped else f"{stripped}，原片段：{source_file}")
+        elif stripped.startswith("- 视频时间"):
+            sources.append(stripped if "原片段：" in stripped else f"{stripped}，原片段：{source_file}")
+    if not sources:
+        sources.append(f"- 视频时间未识别，原片段：{source_file}")
+    return sources
+
+
+def screenshot_lines(content: str) -> list[str]:
+    return re.findall(r"(?m)^!\[视频截图[^\n]*$", content or "")
+
+
+def original_segment_index_lines(content: str, fallback_file: str) -> list[str]:
+    section = markdown_section(content, "原始片段索引")
+    if not section:
+        return [f"- {fallback_file}"]
+    lines = [line.strip() for line in section.splitlines() if line.strip().startswith("- ")]
+    return lines or [f"- {fallback_file}"]
+
+
+def dedupe_keep_order(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for item in items:
+        key = item.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def renumber_screenshot_lines(lines: list[str]) -> list[str]:
+    renumbered = []
+    for i, line in enumerate(dedupe_keep_order(lines), start=1):
+        renumbered.append(re.sub(r"!\[视频截图\s*\d+", f"![视频截图 {i}", line, count=1))
+    return renumbered
+
+
+def should_fuse_problem_pair(prev_path: Path, curr_path: Path, prev_content: str, curr_content: str, mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    prev_title = first_markdown_heading(prev_content, prev_path.stem)
+    curr_title = first_markdown_heading(curr_content, curr_path.stem)
+    if titles_similar(prev_title, curr_title):
+        return True
+    if FUSION_CONTINUATION_RE.search(curr_title):
+        return True
+    if FUSION_CONTINUATION_RE.search(curr_path.stem):
+        return True
+    curr_body = "\n".join((curr_content or "").splitlines()[:12])
+    return bool(re.search(r"继续|接下来|下面|再来|因此|于是|回到原", curr_body))
+
+
+def build_fusion_groups(problem_files: list[Path], mode: str = "auto") -> list[list[Path]]:
+    files = sorted(problem_files, key=problem_file_number)
+    if mode == "never" or len(files) <= 1:
+        return [[path] for path in files]
+    groups: list[list[Path]] = []
+    i = 0
+    while i < len(files):
+        current = files[i]
+        if i + 1 >= len(files):
+            groups.append([current])
+            break
+        nxt = files[i + 1]
+        if should_fuse_problem_pair(
+            current,
+            nxt,
+            current.read_text(encoding="utf-8"),
+            nxt.read_text(encoding="utf-8"),
+            mode,
+        ):
+            groups.append([current, nxt])
+            i += 2
+            continue
+        groups.append([current])
+        i += 1
+    return groups
+
+
+def compose_fused_problem_markdown(group: list[Path]) -> str:
+    contents = [path.read_text(encoding="utf-8") for path in group]
+    title = first_markdown_heading(contents[0], group[0].stem)
+    sources = dedupe_keep_order([
+        line
+        for path, content in zip(group, contents)
+        for line in problem_source_lines(content, path.name)
+    ])
+    statements = dedupe_keep_order([
+        markdown_section_any(content, ["题面（融合整理）", "题面（板书/PPT 提取）"])
+        for content in contents
+    ])
+    solutions = dedupe_keep_order([
+        markdown_section_any(content, ["解答（去重融合）", "解答"])
+        for content in contents
+    ])
+    key_points = dedupe_keep_order([
+        markdown_section(content, "老师强调的关键点")
+        for content in contents
+    ])
+    extras = dedupe_keep_order([
+        markdown_section(content, "补充")
+        for content in contents
+    ])
+    images = renumber_screenshot_lines([
+        line for content in contents for line in screenshot_lines(content)
+    ])
+
+    lines = [f"# {title}", "", "## 来源片段", ""]
+    lines.extend(sources)
+    lines.append("")
+
+    if statements:
+        lines.extend(["## 题面（融合整理）", ""])
+        lines.append(statements[0])
+        if len(statements) > 1:
+            lines.append("")
+            lines.append("### 视频片段补充")
+            for statement in statements[1:]:
+                lines.append("")
+                lines.append(statement)
+        lines.append("")
+
+    if images:
+        lines.extend(["## 视频截图", ""])
+        lines.extend(images[:4])
+        lines.append("")
+
+    if solutions:
+        lines.extend(["## 解答（去重融合）", ""])
+        for i, solution in enumerate(solutions, start=1):
+            if len(solutions) > 1:
+                lines.append(f"### 片段 {i}")
+                lines.append("")
+            lines.append(solution)
+            lines.append("")
+
+    if key_points:
+        lines.extend(["## 老师强调的关键点", ""])
+        lines.extend(key_points)
+        lines.append("")
+
+    if extras:
+        lines.extend(["## 补充", ""])
+        lines.extend(extras)
+        lines.append("")
+
+    original_segments = dedupe_keep_order([
+        line
+        for path, content in zip(group, contents)
+        for line in original_segment_index_lines(content, path.name)
+    ])
+    lines.extend(["## 原始片段索引", ""])
+    lines.extend(original_segments)
+    lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def backup_problem_files(out_dir: Path, files: list[Path]) -> Path:
+    backup_dir = Path(out_dir) / "problems_raw_segments"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for path in files:
+        shutil.copy2(path, backup_dir / path.name)
+    return backup_dir
+
+
+def write_problem_index_from_files(out_dir: Path, problem_files: list[Path]) -> None:
+    manifest = [
+        {"idx": i, "file": path.name, "title": first_markdown_heading(path.read_text(encoding="utf-8"), path.stem)}
+        for i, path in enumerate(sorted(problem_files, key=problem_file_number), start=1)
+    ]
+    write_index(out_dir, manifest)
+
+
+def run_one_fusion_round(out_dir: Path, mode: str, round_number: int) -> dict:
+    out_dir = Path(out_dir)
+    problems_dir = out_dir / "problems"
+    problem_files = list_existing_problem_markdowns(problems_dir)
+    groups = build_fusion_groups(problem_files, mode=mode)
+    fused_groups = [group for group in groups if len(group) > 1]
+    if not fused_groups:
+        write_problem_index_from_files(out_dir, problem_files)
+        return {"round": round_number, "groups": [], "removed": 0, "files": len(problem_files)}
+
+    fusion_manifest = []
+    removed = 0
+    final_files: list[Path] = []
+    for group in groups:
+        final_path = group[0]
+        if len(group) > 1:
+            atomic_write_text(final_path, compose_fused_problem_markdown(group), encoding="utf-8")
+            for obsolete in group[1:]:
+                if obsolete.exists():
+                    obsolete.unlink()
+                    removed += 1
+            fusion_manifest.append({
+                "round": round_number,
+                "file": final_path.name,
+                "sources": [path.name for path in group],
+            })
+        final_files.append(final_path)
+
+    final_files = [path for path in final_files if path.exists()]
+    write_problem_index_from_files(out_dir, final_files)
+    return {"round": round_number, "groups": fusion_manifest, "removed": removed, "files": len(final_files)}
+
+
+def fuse_problem_markdowns(
+    out_dir: Path,
+    mode: str = "auto",
+    rounds: int = 3,
+    *,
+    engine: str = "rules",
+    complete=None,
+    threshold: float = 0.72,
+) -> dict:
+    out_dir = Path(out_dir)
+    if engine == "semantic":
+        report = fuse_problem_directory(
+            out_dir,
+            complete=complete,
+            mode=mode,
+            engine=engine,
+            rounds=rounds,
+            threshold=threshold,
+            generator="video2md",
+            model=MODEL,
+        )
+        round_reports = report.get("rounds", [])
+        return {
+            "groups": sum(
+                1
+                for round_report in round_reports
+                for decision in round_report.get("decisions", [])
+                if decision.get("related")
+            ),
+            "removed": int(report.get("removed", 0)),
+            "files": int(report.get("files", 0)),
+            "rounds": len(round_reports),
+            "engine": engine,
+        }
+
+    problems_dir = out_dir / "problems"
+    original_files = list_existing_problem_markdowns(problems_dir)
+    rounds = max(0, int(rounds or 0))
+    if mode == "never" or rounds == 0:
+        write_problem_index_from_files(out_dir, original_files)
+        atomic_write_json(out_dir / "fusion_manifest.json", {"mode": mode, "rounds": []})
+        return {"groups": 0, "removed": 0, "files": len(original_files), "rounds": 0}
+
+    if original_files:
+        backup_problem_files(out_dir, original_files)
+
+    round_results = []
+    total_groups = 0
+    total_removed = 0
+    for round_number in range(1, rounds + 1):
+        result = run_one_fusion_round(out_dir, mode=mode, round_number=round_number)
+        round_results.append(result)
+        group_count = len(result["groups"])
+        total_groups += group_count
+        total_removed += result["removed"]
+        if group_count == 0:
+            break
+
+    final_files = list_existing_problem_markdowns(problems_dir)
+    atomic_write_json(out_dir / "fusion_manifest.json", {
+        "mode": mode,
+        "requested_rounds": rounds,
+        "rounds": round_results,
+    })
+    return {
+        "groups": total_groups,
+        "removed": total_removed,
+        "files": len(final_files),
+        "rounds": len(round_results),
+    }
+
+
+def step_generate_problem_md(problem: dict, frames: list, descriptions: dict, cues: list, out_dir: Path):
+    """Generate one .md per problem: vision + transcript + LLM reasoning"""
+    idx_start = problem["start_idx"]
+    idx_end = problem["end_idx"]
+    problem_frames = [frames[i] for i in range(idx_start, idx_end + 1) if (str(i) in descriptions or i in descriptions)]
+
+    if not problem_frames:
+        log(f"  ⚠ problem [{idx_start}-{idx_end}] no described frames, skip")
+        return None
+
+    # Get transcript for this segment using frame manifest timestamps when available.
+    ts_start = frame_timestamp(frames[idx_start]) if idx_start < len(frames) else None
+    ts_end = frame_timestamp(frames[idx_end]) if idx_end < len(frames) else None
+    t_start = ts_start if ts_start is not None else idx_start * INTERVAL_S
+    t_end = (ts_end + INTERVAL_S) if ts_end is not None else (idx_end + 1) * INTERVAL_S
+    transcript = get_transcript_for_range(cues, t_start, t_end)
+
+    # Vision: get all the OCR'd content
+    descs_combined = []
+    for i in range(idx_start, idx_end + 1):
+        d = descriptions.get(str(i)) or descriptions.get(i, {})
+        if d:
+            descs_combined.append(d.get("description", ""))
+    vision_text = "\n".join(descs_combined)
+
+    # Generate final markdown via local Qwen.
+    prompt = f"""你是数学课助教。基于以下材料，写一道完整的题目解答（中文 + LaTeX）。
+
+## 视频板书/PPT 文字
+{vision_text[:3000]}
+
+## 老师口述（该片段）
+{transcript[:2000]}
+
+## 要求
+- 识别这是**哪一道题/概念**（题目或命题）
+- 用 LaTeX 写出**完整题面**（含条件、问法）
+- 给出**完整解答步骤**，用 LaTeX，步骤清晰
+- 提取老师讲的**关键点**（如"单调性充要条件"、"端点检验"等）
+- 若你的数学知识能补充"为什么这样解"或更一般的规律，请加在 "## 补充" 段
+- 若识别不出明确题目，标题写"概念/命题：[主题]"，下面写定义+关键性质+老师口述补充
+
+输出 markdown（不要写 ```markdown 包裹），结构：
+```
+# [标题]
+
+**来源**: 视频 [t={t_start}s–{t_end}s]
+**关键词**: [...]
+
+## 题面（板书/PPT 提取）
+...
+
+## 解答
+...
+
+## 老师强调的关键点
+- ...
+
+## 补充（如有）
+...
+```
+"""
+    try:
+        content = llm_complete(prompt, max_tokens=4000, temperature=0.0)
+        return content
+    except CodexUsageLimitError:
+        raise
+    except Exception as e:
+        log(f"  generate error for problem {idx_start}: {e}")
+        return None
+
+
+def final_generation_workers() -> int:
+    return 1 if resolve_provider(LLM_PROVIDER) == "codex" else 2
+
+
+def semantic_fusion_complete(prompt: str, max_tokens: int) -> str:
+    return qwen_complete(
+        [{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=0.0,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("video", type=Path, nargs="?")
+    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--interval", type=int, default=20, help="seconds between frames")
+    parser.add_argument("--limit", type=int, default=None, help="process only first N seconds")
+    parser.add_argument("--start", type=int, default=0, help="start at N seconds")
+    parser.add_argument(
+        "--provider",
+        choices=sorted(SUPPORTED_PROVIDERS),
+        default=None,
+        help="LLM provider: qwen only; can also use VIDEO2MD_PROVIDER",
+    )
+    parser.add_argument("--base-url", help="本地 Qwen OpenAI-compatible base URL")
+    parser.add_argument("--model", help="本地 Qwen 模型名或模型目录")
+    parser.add_argument("--codex-mode", choices=["final", "full"], default=None,
+                        help="Codex mode: final uses existing frame descriptions; full also sends frames to Codex")
+    parser.add_argument("--embed-images", choices=["auto", "always", "never"], default="auto",
+                        help="Embed selected frame screenshots in problem markdown: auto (default), always, or never")
+    parser.add_argument("--max-images-per-problem", type=int, default=2,
+                        help="maximum screenshots to embed per problem when --embed-images is enabled")
+    parser.add_argument("--retrofit-existing-problems", action="store_true",
+                        help="only inject screenshots into existing problems/pNNN_*.md files; do not create problem files or rewrite index")
+    parser.add_argument("--fuse-problems", choices=["auto", "always", "never"], default="auto",
+                        help="Fuse adjacent generated problems using markdown-only post-processing")
+    parser.add_argument("--fuse-rounds", type=int, default=3,
+                        help="maximum markdown-only fusion rounds; stops early when no adjacent files are related")
+    parser.add_argument("--fuse-engine", choices=["semantic", "rules"], default="semantic",
+                        help="semantic uses local Qwen to judge adjacency and merge without information loss")
+    parser.add_argument("--fusion-threshold", type=float, default=0.72,
+                        help="minimum semantic relation score for fusing adjacent markdown files")
+    parser.add_argument("--fuse-only", action="store_true",
+                        help="only fuse existing --out/problems markdown files; do not read video, frames, or transcript")
+    args = parser.parse_args()
+
+    global INTERVAL_S, LLM_PROVIDER, CODEX_MODE, EMBED_IMAGES_MODE, EMBED_IMAGE_LIMIT, BASE_URL, MODEL
+    INTERVAL_S = args.interval
+    LLM_PROVIDER = resolve_provider(args.provider)
+    CODEX_MODE = resolve_codex_mode(args.codex_mode)
+    EMBED_IMAGES_MODE = args.embed_images
+    EMBED_IMAGE_LIMIT = max(0, args.max_images_per_problem)
+    if args.base_url:
+        BASE_URL = args.base_url.rstrip("/")
+    if args.model:
+        MODEL = args.model
+
+    if args.fuse_only:
+        if not args.out:
+            sys.exit("--fuse-only requires --out")
+        result = fuse_problem_markdowns(
+            args.out,
+            mode=args.fuse_problems,
+            rounds=args.fuse_rounds,
+            engine=args.fuse_engine,
+            complete=semantic_fusion_complete if args.fuse_engine == "semantic" else None,
+            threshold=args.fusion_threshold,
+        )
+        log(
+            f"Fusion done: rounds={result['rounds']} groups={result['groups']} "
+            f"removed={result['removed']} files={result['files']}"
+        )
+        return
+
+    video = args.video
+    if video is None:
+        sys.exit("Video path is required unless --fuse-only is used")
+    if not video.exists():
+        sys.exit(f"Video not found: {video}")
+
+    # Setup output dir
+    if args.out:
+        out_dir = args.out
+    else:
+        out_dir = Path("./video2md_out") / video.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # If --start or --limit, cut the video first
+    work_video = video
+    if args.start or args.limit:
+        cut = out_dir / "_cut_input.flv"
+        cmd = ["ffmpeg", "-y", "-ss", str(args.start)]
+        if args.limit:
+            cmd += ["-t", str(args.limit)]
+        cmd += ["-i", str(video), "-c", "copy", str(cut)]
+        r = run(cmd)
+        if r.returncode != 0:
+            raise RuntimeError(f"ffmpeg cut failed: {r.stderr[-500:]}")
+        work_video = cut
+        log(f"cut to [{args.start}, {args.start + (args.limit or 0)}]s")
+
+    log(f"Pipeline for: {work_video.name}")
+    log(f"Provider: {LLM_PROVIDER}")
+    if LLM_PROVIDER == "qwen":
+        log(f"Qwen endpoint: {BASE_URL}")
+        log(f"Qwen model: {MODEL}")
+    if LLM_PROVIDER == "codex":
+        log(f"Codex mode: {CODEX_MODE}")
+    log(f"Output: {out_dir}")
+
+    log("Step 1/4: Extract audio")
+    audio = step_extract_audio(work_video, out_dir)
+
+    log("Step 2/4: Transcribe")
+    vtt = step_transcribe(audio, out_dir)
+    cues = parse_vtt(vtt)
+    log(f"  → {len(cues)} cues")
+
+    log("Step 3/4: Extract frames + describe (vision)")
+    frames = step_extract_frames(work_video, out_dir, interval_s=INTERVAL_S)
+    log(f"  → {len(frames)} frames")
+    descriptions = step_describe_frames(frames)
+
+    log("Step 4/4: Generate per-problem markdown")
+    problems = step_segment_problems(descriptions, cues)
+    log(f"  → {len(problems)} problem segments")
+
+    problems_dir = out_dir / "problems"
+    problems_dir.mkdir(exist_ok=True)
+
+    if args.retrofit_existing_problems:
+        results = retrofit_existing_problem_markdowns(
+            problems,
+            frames,
+            descriptions,
+            problems_dir,
+            mode=EMBED_IMAGES_MODE,
+            max_images=EMBED_IMAGE_LIMIT,
+        )
+        for fpath, status in results:
+            tag = "✓" if status in ("updated", "unchanged") else "✗"
+            log(f"  {tag} retrofit {fpath.name} ({status})")
+        log(f"Done. Retrofitted existing problems only; index unchanged: {out_dir / 'index.md'}")
+        return
+
+    manifest = []
+    MAX_WORKERS = final_generation_workers()
+
+    def _process_one(i_prob):
+        i, prob = i_prob
+        safe_title = re.sub(r"[^\w\u4e00-\u9fff\-]+", "_", prob["title"])[:50]
+        fname = f"p{i+1:03d}_{safe_title}.md"
+        fpath = resolve_problem_markdown_path(problems_dir, i + 1, fname)
+        fname = fpath.name
+        if fpath.exists() and fpath.stat().st_size > 200:
+            content = fpath.read_text(encoding="utf-8")
+            updated = inject_visuals_for_problem_content(
+                content,
+                prob,
+                frames,
+                descriptions,
+                problems_dir,
+                problem_number=i + 1,
+                mode=EMBED_IMAGES_MODE,
+                max_images=EMBED_IMAGE_LIMIT,
+            )
+            if updated != content:
+                atomic_write_text(fpath, updated, encoding="utf-8")
+                return (i, prob["title"], fname, "cached+visuals", None)
+            return (i, prob["title"], fname, "cached", None)
+        try:
+            content = step_generate_problem_md(prob, frames, descriptions, cues, problems_dir)
+            if content:
+                content = strip_think_block(content)
+                content = normalize_markdown_for_obsidian(content)
+                content = inject_visuals_for_problem_content(
+                    content,
+                    prob,
+                    frames,
+                    descriptions,
+                    problems_dir,
+                    problem_number=i + 1,
+                    mode=EMBED_IMAGES_MODE,
+                    max_images=EMBED_IMAGE_LIMIT,
+                )
+                if _looks_like_problem_md(content):
+                    atomic_write_text(fpath, content, encoding="utf-8")
+                    return (i, prob["title"], fname, "ok", None)
+                # 宽松兜底：sanity 失败也保存，标 .raw.md
+                raw_path = problems_dir / fname.replace(".md", ".raw.md")
+                atomic_write_text(raw_path, content, encoding="utf-8")
+                # 也存 .md（用户想看就 .raw.md 删了看）
+                atomic_write_text(fpath, content, encoding="utf-8")
+                return (i, prob["title"], fname, "loose-ok", content)
+            return (i, prob["title"], fname, "empty", None)
+        except CodexUsageLimitError:
+            raise
+        except Exception as e:
+            return (i, prob["title"], fname, f"error: {e}", None)
+
+    log(f"  generating {len(problems)} problem MDs (parallel={MAX_WORKERS})...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(_process_one, (i, prob)): (i, prob) for i, prob in enumerate(problems)}
+        for fut in concurrent.futures.as_completed(futures):
+            i, prob = futures[fut]
+            try:
+                idx, title, fname, status, bad_content = fut.result()
+            except CodexUsageLimitError as e:
+                log(f"  ✗ Codex usage limit reached: {e}")
+                raise
+            ok_statuses = ("ok", "cached", "cached+visuals", "loose-ok")
+            tag = "✓" if status in ok_statuses else "✗"
+            log(f"  {tag} [{i+1}/{len(problems)}] {title} ({status})")
+            if status in ok_statuses:
+                manifest.append({"idx": i+1, "file": fname, "title": title})
+
+    write_index(out_dir, manifest)
+    if args.fuse_problems != "never":
+        log("Step 5/5: Fuse adjacent problem markdowns")
+        result = fuse_problem_markdowns(
+            out_dir,
+            mode=args.fuse_problems,
+            rounds=args.fuse_rounds,
+            engine=args.fuse_engine,
+            complete=semantic_fusion_complete if args.fuse_engine == "semantic" else None,
+            threshold=args.fusion_threshold,
+        )
+        log(
+            f"  fusion rounds={result['rounds']} groups={result['groups']} "
+            f"removed={result['removed']} files={result['files']}"
+        )
+    refresh_bundle_metadata(
+        out_dir,
+        generator="video2md",
+        model=MODEL,
+        extra={
+            "source_kind": "video",
+            "source": str(video),
+            "fusion_engine": args.fuse_engine if args.fuse_problems != "never" else None,
+        },
+    )
+    log(f"Done. Output: {out_dir}")
+    log(f"  Index: {out_dir / 'index.md'}")
+
+
+def write_index(out_dir: Path, manifest: list):
+    idx_path = out_dir / "index.md"
+    manifest = sorted(manifest, key=lambda m: m["idx"])
+    atomic_write_text(idx_path, "# 视频题目索引\n\n" + "\n".join(
+        f"- [{m['idx']}. {m['title']}](problems/{m['file']})" for m in manifest
+    ) + f"\n\n_共 {len(manifest)} 道题_\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

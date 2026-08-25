@@ -1,0 +1,35 @@
+#!/bin/bash
+# v2md-status: generic video2md progress summary
+unset PATH
+export PATH="/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin"
+
+OUT_ROOT="${VIDEO2MD_OUT:-$HOME/video2md_out}"
+LOG=$(find "$OUT_ROOT" -maxdepth 2 -type f -name "*.log" 2>/dev/null | sort -r | head -1)
+
+echo "=== 当前在跑 ==="
+ps aux | grep -E "video2md |mlx_whisper" | grep -v grep | awk '{print "  PID="$2"  CPU="$3"%  跑了 "$10"  "$NF}' | head -10
+
+echo ""
+echo "=== 最近输出目录进度 ==="
+find "$OUT_ROOT" -maxdepth 2 -type d 2>/dev/null | while read -r d; do
+  [ -d "$d/frames" ] || continue
+  name=${d#"$OUT_ROOT"/}
+  frames=$(find "$d/frames" -maxdepth 1 -type f -name "*.jpg" 2>/dev/null | wc -l | tr -d ' ')
+  desc_file="$d/frames/descriptions.json"
+  if [ -f "$desc_file" ]; then
+    descs=$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$desc_file" 2>/dev/null || echo "?")
+  else
+    descs=0
+  fi
+  mds=$(find "$d" -maxdepth 2 -type f -name "p*.md" ! -name "*.raw.md" 2>/dev/null | wc -l | tr -d ' ')
+  echo "  $name: 帧=$frames  描述=$descs  MD=$mds"
+done | sort | tail -30
+
+echo ""
+echo "=== 最近 log ==="
+if [ -n "$LOG" ]; then
+  echo "$LOG"
+  tail -10 "$LOG" 2>/dev/null
+else
+  echo "未找到 log"
+fi

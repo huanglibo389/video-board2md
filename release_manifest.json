@@ -1,0 +1,181 @@
+{
+  "schema": "math2md-github-release",
+  "version": 1,
+  "files": [
+    {
+      "path": ".gitattributes",
+      "bytes": 209,
+      "sha256": "e107092350d30d1af552d3c4b58a4d1e5f6940a247faf5b33b8fcbd5ddb5d892"
+    },
+    {
+      "path": ".github/workflows/tests.yml",
+      "bytes": 933,
+      "sha256": "9d650f044c1677fb014c4895704d51bea1dc04c86278b9c2d46d610586687c9b"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 292,
+      "sha256": "1375b28091de65af30cf09020381a8caaef1ae277415d9bc5ea8beca37e312a2"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 1069,
+      "sha256": "65c995cfca6b2f2ea296791bd12c5d5dae95f55c26b37ecde2ee7c5e60a25a9b"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3317,
+      "sha256": "5aecba45c448393562b71f97100e8343c5f0b3b2e6fb9bfa2fed137d8e182888"
+    },
+    {
+      "path": "board2md/README.md",
+      "bytes": 8021,
+      "sha256": "ed3e7fcc55386f93a97787d282efb0243c0155d77a6a4a03043e5210bda53b30"
+    },
+    {
+      "path": "board2md/board2md",
+      "bytes": 158,
+      "sha256": "40ea5c5cdb7bca5b3fefed75fa66f33d985b3268e8d70a3cb9a4d649f94f9cd9"
+    },
+    {
+      "path": "board2md/board2md_core.py",
+      "bytes": 46698,
+      "sha256": "c06470114daf49d364214b300c0d5f3ca1b5c87aac99f0089b07d58c56c7541f"
+    },
+    {
+      "path": "board2md/prompts/printed_math_book_raw.md",
+      "bytes": 1235,
+      "sha256": "1558fe70502363ac4560cd8c83ea9b7007fee144d862b8ac99401d45552fa634"
+    },
+    {
+      "path": "board2md/prompts/printed_math_page_probe.md",
+      "bytes": 442,
+      "sha256": "9967a16fece537c3b2d3f78b53bfb8c2edbd4098077666020b4a357700a6a10f"
+    },
+    {
+      "path": "board2md/tests/test_board2md_core.py",
+      "bytes": 21203,
+      "sha256": "4e1b13b946eae060ac998df0d20b4827500780c9e1b83dc462e6e5cdd38397aa"
+    },
+    {
+      "path": "board2md/tests/test_board2md_mathmd_bundle.py",
+      "bytes": 2231,
+      "sha256": "ac34ea270d3a91bf82c843edb1cf4a6303b47be94e6730adcd237e86befcf4ce"
+    },
+    {
+      "path": "install.sh",
+      "bytes": 662,
+      "sha256": "e21ae7cd6acc6642adb87ccfe44389d9f2a1b13e58a132f77e94b656221dbafd"
+    },
+    {
+      "path": "math2md/README.md",
+      "bytes": 3104,
+      "sha256": "95396790c11a91222157bfc90a134d4712e5381f300c8cbc9697d6b4f0ed5e84"
+    },
+    {
+      "path": "math2md/math2md",
+      "bytes": 177,
+      "sha256": "1274de7b75394028d735dc9810e7c39a95d95d68d01ba5dd31757fdf907b1a01"
+    },
+    {
+      "path": "math2md/math2md_core.py",
+      "bytes": 12454,
+      "sha256": "2faa039f1f82d29005d1ac9b49c26154f11e9d418339f3f27ee7a68e91bd3266"
+    },
+    {
+      "path": "math2md/tests/test_math2md_core.py",
+      "bytes": 5995,
+      "sha256": "c1c5f13940c04cb4ce5e371bfe9a46711d3bfa4cff08fd7e8054deb795737795"
+    },
+    {
+      "path": "mathmd_shared/README.md",
+      "bytes": 795,
+      "sha256": "0dd49653872d42b953708d56917ed4cd52df17419f6b3daef71ef9da0e7392c5"
+    },
+    {
+      "path": "mathmd_shared/__init__.py",
+      "bytes": 1193,
+      "sha256": "260b5c7bca7d7ed457efd6a390a67e5bd25aacb7db45040b2d28f6bcb6637fae"
+    },
+    {
+      "path": "mathmd_shared/alignment.py",
+      "bytes": 9555,
+      "sha256": "d86307c455fe136856d3c8ffac2d9a37917261f81cce8782eb4cce689db1ace1"
+    },
+    {
+      "path": "mathmd_shared/bundle.py",
+      "bytes": 11702,
+      "sha256": "c8846458afd5fb913f98369f18683744de2758363681d88a5fe0cb00c246a99e"
+    },
+    {
+      "path": "mathmd_shared/fusion.py",
+      "bytes": 12773,
+      "sha256": "df650bc4d1d5df131711bad146c1396de10d488931d5c84f24083a824d184be9"
+    },
+    {
+      "path": "mathmd_shared/markdown.py",
+      "bytes": 6346,
+      "sha256": "70a707a76a17757abb5d3bf091e3bb664cdd4c445f85147666d38f2d33ea8079"
+    },
+    {
+      "path": "mathmd_shared/qwen.py",
+      "bytes": 5517,
+      "sha256": "a09297c7f7fe9092b0e4db735c089b6dd087e9dba1f09c9871ee6802a330981f"
+    },
+    {
+      "path": "mathmd_shared/tests/test_shared.py",
+      "bytes": 13661,
+      "sha256": "e3dbe9b526b0f5e893dc778469493d2750ad119fc7a667a3ba561c891ba95f01"
+    },
+    {
+      "path": "requirements.txt",
+      "bytes": 33,
+      "sha256": "ccb1187ac73825706897f9f2aa98899d6a8ca81cfc3c56eaaf518555ca94caa2"
+    },
+    {
+      "path": "video2md_review/README.md",
+      "bytes": 2647,
+      "sha256": "721394c7dac4ab4624ef351119ebc81ae43a9ffc704ca6b46341f055c73569d6"
+    },
+    {
+      "path": "video2md_review/test_video2md_offline.py",
+      "bytes": 35128,
+      "sha256": "3ae7eed4dc072e96cd565089ab55f3617b7fd905363ef09b117334477ad6bd1b"
+    },
+    {
+      "path": "video2md_review/test_video2md_semantic_fusion.py",
+      "bytes": 3636,
+      "sha256": "69e0d1e149a0251c141cc4c9a0d0779311ae39bddd0ed82a871b185f13f97f1f"
+    },
+    {
+      "path": "video2md_review/v2md-batch",
+      "bytes": 1988,
+      "sha256": "d32f99171f376d4416182977be34a57cf86aa315fca4f27028b6061c5b1c1704"
+    },
+    {
+      "path": "video2md_review/v2md-queue2",
+      "bytes": 6690,
+      "sha256": "3ea9917695dcdd00f55a79f721997647525362107a2041ebab085ba0e424ef08"
+    },
+    {
+      "path": "video2md_review/v2md-sleep-run",
+      "bytes": 1170,
+      "sha256": "272098a962bf1d43e5c72b6b592bc48f0565d285490580d78cae99d12ef008a7"
+    },
+    {
+      "path": "video2md_review/v2md-status",
+      "bytes": 1249,
+      "sha256": "4670970f6fda10275a6fc36ff01aa4e19d4f196cf6bfc91da804873873b17c1d"
+    },
+    {
+      "path": "video2md_review/video2md",
+      "bytes": 70536,
+      "sha256": "8cf3870a6f8a0f7ebe2d1af5bf53d627fd6256282c1c959aefb2603e4d196b65"
+    },
+    {
+      "path": "video2md_review/video2md-merge",
+      "bytes": 2407,
+      "sha256": "29c6dc96f4b4a805039e7346e22a5ec7873ab6b168a4ef4ae72b67f75d2497d0"
+    }
+  ]
+}

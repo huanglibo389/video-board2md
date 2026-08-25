@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""video2md-merge: 把多个 video2md 输出目录的 problems/*.md 合并成一个 .md
+
+用法:
+  video2md-merge DIR1 [DIR2 ...] [-o output.md]
+  video2md-merge video2md_out/微积分02-3 video2md_out/线代01 -o 全部.md
+"""
+import sys
+import re
+import os
+import tempfile
+from pathlib import Path
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def main():
+    dirs = []
+    output = None
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "-o" and i + 1 < len(args):
+            output = Path(args[i + 1])
+            i += 2
+        else:
+            dirs.append(Path(args[i]))
+            i += 1
+
+    if not dirs:
+        print("usage: video2md-merge DIR1 [DIR2 ...] [-o output.md]", file=sys.stderr)
+        sys.exit(1)
+
+    if output is None:
+        output = Path("merged.md")
+
+    parts = []
+    for d in dirs:
+        if not d.is_dir():
+            print(f"⚠ skip: {d} not a directory", file=sys.stderr)
+            continue
+        title = d.name
+        problems = sorted(p for p in d.glob("problems/p*.md") if not p.name.endswith(".raw.md"))
+        if not problems:
+            problems = sorted(p for p in d.glob("p*.md") if not p.name.endswith(".raw.md"))
+        if not problems:
+            print(f"⚠ skip: {d} has no problems/p*.md or root p*.md", file=sys.stderr)
+            continue
+        parts.append(f"\n# {title}\n")
+        for p in problems:
+            m = re.match(r"p\d+_(.+)\.md", p.name)
+            t = m.group(1).replace("_", " ") if m else p.stem
+            parts.append(f"\n## {t}\n\n")
+            parts.append(p.read_text(encoding="utf-8"))
+            parts.append("\n\n---\n")
+
+    atomic_write_text(output, "".join(parts), encoding="utf-8")
+    print(f"→ {output} ({len(parts)} sections, {output.stat().st_size} bytes)", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

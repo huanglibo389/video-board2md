@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.sh text eol=lf
+video2md_review/video2md text eol=lf
+video2md_review/video2md-merge text eol=lf
+video2md_review/v2md-* text eol=lf
+math2md/math2md text eol=lf
+board2md/board2md text eol=lf

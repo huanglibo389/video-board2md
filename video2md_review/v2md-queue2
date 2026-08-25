@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Run video2md jobs with a fixed-width queue.
+
+Keeps at most N `v2md-sleep-run` processes active at once, skips outputs that
+already have an index, and prints a short summary at the end.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".flv", ".webm", ".m4v"}
+DEFAULT_OUT_ROOT = Path(os.environ.get("VIDEO2MD_OUT", str(Path.home() / "video2md_out")))
+SCRIPT_DIR = Path(__file__).resolve().parent
+SLEEP_RUN = SCRIPT_DIR / "v2md-sleep-run"
+
+
+@dataclass(frozen=True)
+class Job:
+    video: Path
+    out_dir: Path
+
+
+@dataclass(frozen=True)
+class JobResult:
+    job: Job
+    status: str
+    returncode: int
+
+
+def sanitize_stem(video: Path) -> str:
+    return video.stem.replace(" ", "_")
+
+
+def build_output_dir(video: Path, out_root: Path, provider: str, codex_mode: str | None, interval: int) -> Path:
+    parts = [sanitize_stem(video), provider]
+    if provider == "codex":
+        parts.append(codex_mode or "final")
+    parts.append(f"i{interval}")
+    return out_root / "_".join(parts)
+
+
+def is_completed_output(out_dir: Path) -> bool:
+    return (out_dir / "index.md").exists()
+
+
+def discover_videos(inputs: list[str]) -> list[Path]:
+    videos: list[Path] = []
+    for raw in inputs:
+        path = Path(raw).expanduser()
+        if path.is_dir():
+            videos.extend(
+                sorted(
+                    item for item in path.iterdir()
+                    if item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS
+                )
+            )
+        elif path.is_file():
+            if path.suffix.lower() in VIDEO_EXTENSIONS:
+                videos.append(path)
+        else:
+            raise FileNotFoundError(f"Input not found: {path}")
+    return sorted(videos)
+
+
+def build_run_command(
+    video: Path,
+    out_dir: Path,
+    provider: str,
+    codex_mode: str | None,
+    interval: int,
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    cmd = [
+        str(SLEEP_RUN),
+        str(video),
+        "--out",
+        str(out_dir),
+        "--provider",
+        provider,
+        "--interval",
+        str(interval),
+    ]
+    if provider == "codex" and codex_mode:
+        cmd.extend(["--codex-mode", codex_mode])
+    if extra_args:
+        cmd.extend(extra_args)
+    return cmd
+
+
+def default_launcher_factory(
+    provider: str,
+    codex_mode: str | None,
+    interval: int,
+    extra_args: list[str],
+) -> Callable[[Job], subprocess.Popen]:
+    def launcher(job: Job) -> subprocess.Popen:
+        cmd = build_run_command(job.video, job.out_dir, provider, codex_mode, interval, extra_args)
+        return subprocess.Popen(cmd)
+
+    return launcher
+
+
+def run_job_queue(
+    jobs: list[Job],
+    jobs_limit: int,
+    launcher: Callable[[Job], object],
+    poll_interval: float = 2.0,
+    on_tick: Callable[[list[tuple[Job, object]]], None] | None = None,
+) -> list[JobResult]:
+    pending = list(jobs)
+    active: list[tuple[Job, object]] = []
+    results: list[JobResult] = []
+
+    while pending or active:
+        while pending and len(active) < jobs_limit:
+            job = pending.pop(0)
+            active.append((job, launcher(job)))
+
+        if on_tick:
+            on_tick(active)
+
+        next_active: list[tuple[Job, object]] = []
+        for job, proc in active:
+            returncode = proc.poll()
+            if returncode is None:
+                next_active.append((job, proc))
+            else:
+                status = "done" if returncode == 0 else "failed"
+                results.append(JobResult(job=job, status=status, returncode=returncode))
+        active = next_active
+
+        if active:
+            time.sleep(poll_interval)
+
+    return results
+
+
+def split_queue_args(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split queue args from args that should be forwarded to video2md."""
+    if "--" not in argv:
+        return argv, []
+    sep = argv.index("--")
+    return argv[:sep], argv[sep + 1:]
+
+
+def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    queue_argv, separated_extra_args = split_queue_args(argv)
+    parser = argparse.ArgumentParser(description="Queue video2md runs with fixed parallelism.")
+    parser.add_argument("inputs", nargs="+", help="Video files or directories containing videos")
+    parser.add_argument("--jobs", type=int, default=2, help="Maximum concurrent jobs")
+    parser.add_argument("--provider", default="qwen", choices=["qwen"])
+    parser.add_argument("--codex-mode", default="full", choices=["final", "full"])
+    parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT)
+    parser.add_argument(
+        "--include-done",
+        action="store_true",
+        help="Do not skip outputs that already contain index.md",
+    )
+    args, extra_args = parser.parse_known_args(queue_argv)
+    return args, extra_args + separated_extra_args
+
+
+def main(argv: list[str]) -> int:
+    args, extra_args = parse_args(argv)
+    if args.jobs < 1:
+        print("--jobs must be >= 1", file=sys.stderr)
+        return 2
+
+    videos = discover_videos(args.inputs)
+    jobs: list[Job] = []
+    skipped: list[Job] = []
+    for video in videos:
+        out_dir = build_output_dir(video, args.out_root, args.provider, args.codex_mode, args.interval)
+        job = Job(video=video, out_dir=out_dir)
+        if not args.include_done and is_completed_output(out_dir):
+            skipped.append(job)
+            continue
+        jobs.append(job)
+
+    print(f"videos_found: {len(videos)}")
+    print(f"queued: {len(jobs)}")
+    print(f"skipped_done: {len(skipped)}")
+    for job in skipped:
+        print(f"SKIP {job.video.name} -> {job.out_dir}")
+
+    if not jobs:
+        print("Nothing to run.")
+        return 0
+
+    launcher = default_launcher_factory(args.provider, args.codex_mode, args.interval, extra_args)
+    results = run_job_queue(jobs, jobs_limit=args.jobs, launcher=launcher)
+
+    done = [item for item in results if item.status == "done"]
+    failed = [item for item in results if item.status == "failed"]
+    for item in done:
+        print(f"DONE {item.job.video.name} -> {item.job.out_dir}")
+    for item in failed:
+        print(f"FAIL {item.job.video.name} (exit={item.returncode}) -> {item.job.out_dir}")
+
+    print("")
+    print("=== summary ===")
+    print(f"done: {len(done)}")
+    print(f"failed: {len(failed)}")
+    print(f"skipped: {len(skipped)}")
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

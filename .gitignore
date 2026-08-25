@@ -1,0 +1,27 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Local model, media, cache, logs, and generated outputs
+.omlx/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.flv
+*.m4v
+*.wav
+*.vtt
+*.part
+*.log
+math2md_out/
+video2md_out/
+board2md_out/
+frames/
+audio/
+problems_raw_segments/

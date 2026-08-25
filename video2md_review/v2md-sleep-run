@@ -1,0 +1,41 @@
+#!/bin/bash
+# v2md-sleep-run: run video2md without caffeinate so macOS sleep pauses it naturally.
+set -o pipefail
+
+unset PATH
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+if [ "$#" -lt 1 ]; then
+  echo "usage: v2md-sleep-run VIDEO [video2md args...]" >&2
+  echo "example: v2md-sleep-run lesson.mp4 --provider qwen --interval 60" >&2
+  exit 2
+fi
+
+OUT_ROOT="${VIDEO2MD_OUT:-$HOME/video2md_out}"
+LOG_DIR="$OUT_ROOT/logs"
+mkdir -p "$LOG_DIR"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VIDEO2MD_BIN="${VIDEO2MD_BIN:-$SCRIPT_DIR/video2md}"
+
+video="$1"
+shift
+base=$(basename "$video")
+base="${base%.*}"
+stamp=$(date "+%Y%m%d_%H%M%S")
+log="$LOG_DIR/${base}_sleep_run_${stamp}.log"
+
+echo "=== v2md-sleep-run ==="
+echo "video: $video"
+echo "log:   $log"
+echo "bin:   $VIDEO2MD_BIN"
+echo "note:  不使用 caffeinate；合盖后 macOS 会自然暂停，开盖后进程通常继续。"
+echo "note:  若本地 Qwen 服务暂时不可用，重跑同一个命令会复用已有输出断点续跑。"
+echo ""
+
+"$VIDEO2MD_BIN" "$video" "$@" 2>&1 | tee "$log"
+status=${PIPESTATUS[0]}
+
+echo ""
+echo "exit_status: $status"
+echo "log: $log"
+exit "$status"
