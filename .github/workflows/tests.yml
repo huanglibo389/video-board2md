@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile mathmd_shared/*.py math2md/*.py board2md/board2md_core.py video2md_review/video2md
+      - run: python -m unittest discover -s mathmd_shared/tests -p 'test_*.py' -v
+      - run: python -m unittest discover -s math2md/tests -p 'test_*.py' -v
+      - run: python -m unittest discover -s board2md/tests -p 'test_*.py' -v
+      - run: python video2md_review/test_video2md_offline.py -v
+      - run: python video2md_review/test_video2md_semantic_fusion.py -v
